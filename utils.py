@@ -1,6 +1,5 @@
 # import modules
-import numpy as np
-import matplotlib.pyplot as plt
+# ...
 
 # create Colour class
 class Colours:

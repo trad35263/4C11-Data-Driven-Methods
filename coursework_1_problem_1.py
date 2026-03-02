@@ -26,7 +26,7 @@ class Inputs:
     ntrain = 600
 
     # number of training epochs
-    no_of_epochs = 20
+    no_of_epochs = 100
 
     # global figure size and fontsize
     figsize = (7, 5)
