@@ -10,6 +10,40 @@ from time import perf_counter as timer
 # import colours
 from utils import Colours as colours
 
+# Dataset class
+class Dataset():
+    """Stores a dataset with options to normalise the data."""
+    def __init__(self, data, ntrain, epsilon = 1e-9):
+        """Creates an instance of the Dataset class."""
+        # store input variables
+        self.data = data
+        self.ntrain = ntrain
+        self.epsilon = epsilon
+
+        # specify the training and test data
+        self.training_data = self.data[:self.ntrain]
+        self.test_data = self.data[self.ntrain:]
+
+        # calculate mean and standard deviation based on training data only
+        self.mean = self.training_data.mean(dim = (0, 1), keepdim = True)
+        self.std = self.training_data.std(
+            dim = (0, 1), unbiased = False, keepdim = True
+        )
+
+        # normalise data
+        self.training_data_normalised = self.normalise(self.training_data)
+        self.test_data_normalised = self.normalise(self.test_data)
+
+    def normalise(self, x):
+        """Normalises a given data using the mean and standard deviation."""
+        # calculate normalised values
+        return (x - self.mean) / (self.std + self.epsilon)
+
+    def inverse_normalise(self, x):
+        """Reverses the normalisation process for a given data."""
+        # calculate unnormalised value(s)
+        return x * (self.std + self.epsilon) + self.mean
+
 # Neural_net class
 class Neural_net(nn.Module):
     """Parent class for all avaiable neural network options."""
@@ -100,6 +134,16 @@ class Neural_net(nn.Module):
             # divide through by number of samples
             test_loss /= len(test_loader)
 
+            print(f"Train loss: {training_loss:.6f} (computed in train mode)")
+            print(f"Test loss: {test_loss:.6f} (computed in eval mode)")
+
+            # Also check if normalizations match
+            train_data_all = torch.cat([el[1] for el in train_loader])
+            test_data_all = torch.cat([el[1] for el in test_loader])
+
+            print(f"Train data range: {train_data_all.min():.4f} to {train_data_all.max():.4f}")
+            print(f"Test data range: {test_data_all.min():.4f} to {test_data_all.max():.4f}")
+
             # print train loss every 10 epochs
             if epoch % 10 == 0:
 
@@ -114,7 +158,7 @@ class Neural_net(nn.Module):
             self.test_loss.append(test_loss)
             self.time.append(t - t_start)
 
-    def plot_convergence(self, figsize, fontsize, fontsize_title):
+    def plot_convergence(self, figsize, fontsize, fontsize_title, file_name):
         """Plots the convergence history of the training and testing."""
         # create plot
         fig, ax = plt.subplots(figsize = figsize)
@@ -129,13 +173,13 @@ class Neural_net(nn.Module):
         ax.set_xlabel("No. of Epochs", fontsize = fontsize)
         ax.set_ylabel("Loss", fontsize = fontsize)
         ax.set_yscale("log")
-        ax.set_ylim(5e-3, 1)
+        #ax.set_ylim(5e-3, 1)
 
         # set title
         ax.text(
             0.5, 1.03,
-            f"{self.label}, "
-            f"Layers: {self.no_of_layers}, Parameters: {self.no_of_params}",
+            f"{file_name} | {self.label} | "
+            f"Layers: {self.no_of_layers} | Parameters: {self.no_of_params}",
             transform = ax.transAxes,
             ha = 'center',
             va = 'bottom',
@@ -170,7 +214,44 @@ class Neural_net(nn.Module):
         self.no_of_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"Number of parameters: {colours.GREEN}{self.no_of_params}{colours.END}")
 
-    # https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module
+# Const_Net class
+class Const_Net(Neural_net):
+    """Specifies the architecture for a recurrent neural network with a linear layer."""
+    def __init__(self, no_of_layers, input_size, hidden_size, output_size, dropout, nonlinearity):
+        # initialise instance of Neural_net class
+        super().__init__(no_of_layers, input_size, hidden_size, output_size)
+
+        # store input variables
+        self.dropout = dropout
+        self.nonlinearity = nonlinearity
+
+        # store label
+        self.label = "Const_Net"
+
+        # create recurrent neural network
+        self.rnn = nn.RNN(
+            input_size = self.input_size,
+            hidden_size = self.hidden_size,
+            num_layers = self.no_of_layers - 1,
+            batch_first = True,
+            dropout = self.dropout,
+            nonlinearity = self.nonlinearity,
+        )
+
+        # create linear layer
+        self.linear = nn.Linear(self.hidden_size, self.output_size)
+
+        # print the number of parameters
+        self.print_params()
+
+    def forward(self, x):
+        """Propagates forwards through the neural network architecture."""
+        # get recurrent neural network output
+        out, _ = self.rnn(x)
+
+        # get linear layer output and return
+        out = self.linear(out)
+        return out
 
 # FCNN class
 class FCNN(Neural_net):

@@ -2,8 +2,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import h5py
-from time import perf_counter as timer
-import random
 
 # import pytorch
 import torch
@@ -11,7 +9,7 @@ import torch.nn as nn
 import torch.utils.data as Data
 
 # import neural network classes
-from neural_nets import FCNN, ResNet, U_Net
+from neural_nets import FCNN, ResNet, U_Net, Dataset
 
 # import colours
 from utils import Colours as colours
@@ -46,28 +44,6 @@ class Inputs:
     # neural network parameters (specific to certain types)
     dropout = 0.5
 
-# create Outputs class
-class Outputs(Inputs):
-    """Stores the most important outputs of the program."""
-    def __init__(
-            self,
-            neural_net, input, output, t_start
-        ):
-        """Creates an instance of the Outputs class."""
-        # store input variables
-        self.neural_net = neural_net
-        self.input = input
-        self.output = output
-        self.t_start = t_start
-
-        # print time taken
-        self.t_end = timer()
-        print(f"Completed after {colours.GREEN}{self.t_end - self.t_start:.4g}{colours.END} s!")
-
-        # print final losses
-        print(f"Final training loss {colours.GREEN}{self.neural_net.training_loss[-1]}{colours.END}")
-        print(f"Final test loss {colours.GREEN}{self.neural_net.test_loss[-1]}{colours.END}")
-
 class Loss_function(nn.Module):
     """Binary cross-entropy loss with logits."""
     def __init__(self):
@@ -97,41 +73,9 @@ class Mat_reader(object):
 
     def get_data(self, key):
         """Reads a given set of data from the data object."""
-        #
+        # convert data corresponding to given key to pytorch tensor
         data = np.array(self.data[key]).transpose()
         return torch.tensor(data, dtype = torch.float32)
-
-# Dataset class
-class Dataset():
-    """Normalises tensors."""
-    def __init__(self, data):
-        """Creates an instance of the Dataset class."""
-        # store input variables
-        self.data = data
-
-        # specify the training and test data
-        self.training_data = self.data[:Inputs.ntrain]
-        self.test_data = self.data[len(self.data) - Inputs.ntrain:]
-
-        # calculate mean and standard deviation based on training data only
-        self.mean = self.training_data.mean(dim = (0, 1), keepdim = True)
-        self.std = self.training_data.std(
-            dim = (0, 1), unbiased = False, keepdim = True
-        )
-
-        # normalise data
-        self.training_data_normalised = self.normalise(self.training_data)
-        self.test_data_normalised = self.normalise(self.test_data)
-
-    def normalise(self, x):
-        """Normalises a given data using the mean and standard deviation."""
-        # calculate normalised values
-        return (x - self.mean) / self.std
-
-    def inverse_normalise(self, x):
-        """Reverses the normalisation process for a given data."""
-        # calculate unnormalised value(s)
-        return x * self.std + self.mean
 
 # main function
 def main():
@@ -139,6 +83,7 @@ def main():
     # set up data reader
     path = Inputs.data_folder + Inputs.file_name
     data_reader = Mat_reader(path)
+    print(f"Reading file {colours.GREEN}{path}{colours.END}...")
 
     # read data
     loading_data = data_reader.get_data("load_apply")
@@ -151,8 +96,8 @@ def main():
     result_data = result_data[shuffled_indices]
 
     # store data in Dataset classes
-    loading = Dataset(loading_data)
-    result = Dataset(result_data)
+    loading = Dataset(loading_data, Inputs.ntrain)
+    result = Dataset(result_data, Inputs.ntrain)
 
     # print user feedback
     print(f"Number of training samples: {colours.GREEN}{Inputs.ntrain}{colours.END}")
