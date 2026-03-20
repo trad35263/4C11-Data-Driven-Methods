@@ -19,7 +19,10 @@ from utils import Colours as colours
 class Inputs:
     """Stores high-level inputs for the program and resultant neural net."""
     # file path of folder containing material data
-    data_folder = "C:/Users/tomra/OneDrive/Documents/Uni/2B Coursework/4C11 Data-Driven Methods/Project_1/Problem_1_student/Data"
+    data_folder = (
+        "C:/Users/tomra/OneDrive/Documents/Uni/2B Coursework/4C11 Data-Driven Methods"
+        "/Coursework 1/Project_1/Problem_1_student/Data"
+    )
     file_name = "Material_C.mat"
 
     # batch size
