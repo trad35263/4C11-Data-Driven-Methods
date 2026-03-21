@@ -1,264 +1,278 @@
+# import modules
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.utils.data as Data
 import numpy as np
-import scipy
+from time import perf_counter as timer
+import datetime
+import h5py
 
-# Define Neural Network
-class DenseNet(nn.Module):
-    def __init__(self, layers, nonlinearity):
-        super(DenseNet, self).__init__()
+# import utils
+import utils
 
-        self.n_layers = len(layers) - 1
+# Inputs class
+class Inputs:
+    """Stores input parameters for the program."""
+    # file paths for training/test data
+    data_folder = "../Coursework 2/Coursework2/Coursework2_Problem_2/"
+    training_path = "Darcy_2D_data_train.mat"
+    test_path = "Darcy_2D_data_test.mat"
 
-        assert self.n_layers >= 1
+    # network hyperparameters
+    no_of_layers = 3
+    channel_width = 16
 
-        self.layers = nn.ModuleList()
+    # training variables
+    no_of_epochs = 50
+    batch_size = 20
+    learning_rate = 5e-3
+    weight_decay = 1e-4
+    step_size = 200
+    gamma = 0.5
 
-        for j in range(self.n_layers):
-            self.layers.append(nn.Linear(layers[j], layers[j + 1]))
+# Lploss class
+class LpLoss(object):
+    """"""
+    def __init__(self, d=2, p=2, size_average=True, reduction=True):
+        """"""
+        #
+        super(LpLoss, self).__init__()
 
-            if j != self.n_layers - 1:
-                self.layers.append(nonlinearity())
+        # Dimension and Lp-norm type are postive
+        assert d > 0 and p > 0
 
-    def forward(self, x):
-        for _, l in enumerate(self.layers):
-            x = l(x)
+        self.d = d
+        self.p = p
+        self.reduction = reduction
+        self.size_average = size_average
 
+    def abs(self, x, y):
+        num_examples = x.size()[0]
+
+        # Assume uniform mesh
+        h = 1.0 / (x.size()[1] - 1.0)
+
+        all_norms = (h ** (self.d / self.p)) * torch.norm(x.view(num_examples, -1) - y.view(num_examples, -1), self.p,
+                                                          1)
+
+        if self.reduction:
+            if self.size_average:
+                return torch.mean(all_norms)
+            else:
+                return torch.sum(all_norms)
+
+        return all_norms
+
+    def rel(self, x, y):
+        num_examples = x.size()[0]
+
+        # print('x.shape',x.shape)
+        # print('y.shape',y.shape)
+        diff_norms = torch.norm(x.reshape(num_examples, -1) - y.reshape(num_examples, -1), self.p, 1)
+        y_norms = torch.norm(y.reshape(num_examples, -1), self.p, 1)
+
+        if self.reduction:
+            if self.size_average:
+                return torch.mean(diff_norms / y_norms)
+            else:
+                return torch.sum(diff_norms / y_norms)
+
+        return diff_norms / y_norms
+
+    def forward(self, x, y):
+        return self.rel(x, y)
+
+    def __call__(self, x, y):
+        return self.forward(x, y)
+
+# Define data reader
+class MatRead(object):
+    def __init__(self, file_path):
+        super(MatRead).__init__()
+
+        self.file_path = file_path
+        self.data = h5py.File(self.file_path)
+
+    def get_a(self):
+        a_field = np.array(self.data['a_field']).T
+        return torch.tensor(a_field, dtype=torch.float32)
+
+    def get_u(self):
+        u_field = np.array(self.data['u_field']).T
+        return torch.tensor(u_field, dtype=torch.float32)
+    
+# Define normaliser, pointwise gaussian
+class UnitGaussianNormaliser(object):
+    def __init__(self, x, eps=0.00001):
+        super(UnitGaussianNormaliser, self).__init__()
+
+        self.mean = torch.mean(x, 0)
+        self.std = torch.std(x, 0)
+        self.eps = eps
+
+    def encode(self, x):
+        x = (x - self.mean) / (self.std + self.eps)
         return x
 
-############################# Data processing #############################
-# Read data from mat
-# Specify your data path here
-path = 'Plate_data.mat'
-data = scipy.io.loadmat(path)
-torch.set_default_tensor_type(torch.DoubleTensor)
-L_boundary = torch.tensor(data['L_boundary'], dtype=torch.float64)
-R_boundary = torch.tensor(data['R_boundary'], dtype=torch.float64)
-T_boundary = torch.tensor(data['T_boundary'], dtype=torch.float64)
-B_boundary = torch.tensor(data['B_boundary'], dtype=torch.float64)
-C_boundary = torch.tensor(data['C_boundary'], dtype=torch.float64)
-Boundary   = torch.tensor(data['Boundary'], dtype=torch.float64, requires_grad=True)
+    def decode(self, x):
+        x = (x * (self.std + self.eps)) + self.mean
+        return x
 
-# truth solution from FEM
-disp_truth = torch.tensor(data['disp_data'], dtype=torch.float64)
+# Define network  
+class CNN(nn.Module):
+    """Convolutional Neural Network (CNN) model."""
+    def __init__(self, base_channels = Inputs.channel_width):
+        super(CNN, self).__init__()
+        self.layers = nn.Sequential(
+            # encoder
+            nn.Conv2d(1, base_channels, kernel_size = 3, padding = 1),
+            nn.ReLU(),
+            nn.Conv2d(base_channels, base_channels * 2, kernel_size = 3, padding = 2, dilation = 2),
+            nn.ReLU(),
+            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size = 3, padding=4, dilation = 4),
+            nn.ReLU(),
+            # decoder
+            nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size = 3, padding = 4, dilation = 4),
+            nn.ReLU(),
+            nn.Conv2d(base_channels * 2, base_channels, kernel_size = 3, padding = 2, dilation = 2),
+            nn.ReLU(),
+            nn.Conv2d(base_channels, 1, kernel_size = 3, padding = 1),
+        )
 
-# connectivity matrix - this helps you to plot the figure but we do not need it for PINN
-t_connect  = torch.tensor(data['t'].astype(float), dtype=torch.float64)
+    def forward(self, x):
+        """Propagates through the neural network and returns the output."""
+        # pass x through neural net and return output
+        x = x.unsqueeze(1)
+        out = self.layers(x)
+        out = out.squeeze(1)
+        return out
 
-# all collocation points
-x_full = torch.tensor(data['p_full'], dtype=torch.float64,requires_grad=True)
+# main function
+def main():
 
-# collocation points excluding the boundary
-x = torch.tensor(data['p'], dtype=torch.float64, requires_grad=True)
+    # read training data from .mat file
+    data_reader = MatRead(Inputs.data_folder + Inputs.training_path)
+    a_train = data_reader.get_a()
+    u_train = data_reader.get_u()
 
-# This chooses 50 fixed points from the truth solution, which we will use for part (e)
-rand_index = torch.randint(0, len(x_full), (50,))
-disp_fix = disp_truth[rand_index,:]
+    # read test data from .mat file
+    data_reader = MatRead(Inputs.data_folder + Inputs.test_path)
+    a_test = data_reader.get_a()
+    u_test = data_reader.get_u()
 
-# We will use two neural networks for the problem:
-# NN1: to map the coordinates [x,y] to displacement u
-# NN2: to map the coordinates [x,y] to the stresses [sigma_11, sigma_22, sigma_12]
-# What we will do later is to first compute strain by differentiate the output of NN1
-# And then we compute a augment stress using Hook's law to find an augmented stress sigma_a
-# And we will require the output of NN2 to match sigma_a  - we shall do this by adding a term in the loss function
-# This will help us to avoid differentiating NN1 twice (why?)
-# As it is well known that PINN suffers from higher order derivatives
+    # create normaliser objects based on training data for a and u
+    a_normaliser = UnitGaussianNormaliser(a_train)
+    u_normaliser = UnitGaussianNormaliser(u_train)
 
-Disp_layer = [2, 300, 300, 2] # Architecture of displacement net - you may change as you wish
-Stress_layer = [2,400,400,3] # Architecture of stress net - you may change as you wish
+    # normalise data
+    a_train = a_normaliser.encode(a_train)
+    a_test = a_normaliser.encode(a_test)
 
-stress_net = DenseNet(Stress_layer,nn.Tanh) # Note we choose hyperbolic tangent as an activation function here
-disp_net =  DenseNet(Disp_layer,nn.Tanh)
+    print("Data shapes:")
+    print(a_train.shape)
+    print(a_test.shape)
+    print(u_train.shape)
+    print(u_test.shape)
 
-# Define material properties
-E =
-mu =
+    # create training data loader
+    training_set = Data.TensorDataset(a_train, u_train)
+    training_loader = Data.DataLoader(training_set, Inputs.batch_size, shuffle=True)
 
-stiff = E/(1-mu**2)*torch.tensor([[1,mu,0],[mu,1,0],[0,0,(1-mu)/2]]) # Hooke's law for plane stress
-stiff = stiff.unsqueeze(0)
+    # create neural network
+    net = CNN()
 
-# PINN requires super large number of iterations to converge (on the order of 50e^3-100e^3)
-#
-iterations =
+    # print user feedback
+    no_of_parameters = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print(f"Number of parameters: {utils.Colours.GREEN}{no_of_parameters}{utils.Colours.END}")
 
-# Define loss function
-loss_func =
+    # define loss function
+    loss_function = LpLoss()
+    optimiser = torch.optim.Adam(
+        net.parameters(), lr = Inputs.learning_rate, weight_decay = Inputs.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimiser, step_size = Inputs.step_size, gamma = Inputs.gamma
+    )
 
-# Broadcast stiffness for batch multiplication later
-stiff_bc = stiff
-stiff = torch.broadcast_to(stiff, (len(x),3,3))
+    # print user feedback
+    print(
+        f"Training CNN for {utils.Colours.GREEN}{Inputs.no_of_epochs}{utils.Colours.END} "
+        "epochs!"
+    )
+    t1 = timer()
+    
+    # create empty lists to store training and test loss
+    training_loss_list = []
+    test_loss_list = []
+    x = []
 
-stiff_bc = torch.broadcast_to(stiff_bc, (len(Boundary),3,3))
+    # loop for each epoch
+    for epoch in range(Inputs.no_of_epochs):
 
-params = list(stress_net.parameters()) + list(disp_net.parameters())
+        # set neural net to train and training loss to zero
+        net.train(True)
+        training_loss = 0
 
-# Define optimizer and scheduler
-optimizer =
-scheduler =
+        # loop for each entry in the training data loader
+        for i, data in enumerate(training_loader):
 
-for epoch in range(iterations):
-    scheduler.step()
-    optimizer.zero_grad()
+            # propagate forward through the neural network and calculate loss
+            input, target = data
+            output = net(input) # Forward
+            output = u_normaliser.decode(output)
+            loss = loss_function(output, target) # Calculate loss
 
-    # To compute stress from stress net
-    sigma = stress_net(x)
-    # To compute displacement from disp net
-    disp     = disp_net(x)
+            optimiser.zero_grad() # Clear gradients
+            loss.backward() # Backward
+            optimiser.step() # Update parameters
+            scheduler.step() # Update learning rate
 
-    # displacement in x direction
-    u = disp[:,0]
-    # displacement in y direction
-    v = disp[:,1]
+            training_loss += loss.item()    
 
-    # find the derivatives
-    dudx = torch.autograd.grad(u, x, grad_outputs=torch.ones_like(u),create_graph=True)[0]
-    dvdx =
+        # Test
+        net.eval()
+        with torch.no_grad():
+            test_output = net(a_test)
+            test_output = u_normaliser.decode(test_output)
+            test_loss = loss_function(test_output, u_test).item()
 
-    # Define strain
-    e_11 = dudx[:,0].unsqueeze(1)
-    e_22 = dvdx[:,1].unsqueeze(1)
-    e_12 =
+        # every 10th epoch
+        if epoch % 1 == 0:
 
-    e = torch.cat((e_11,e_22,e_12), 1)
-    e = e.unsqueeze(2)
+            # print user feedback
+            t2 = timer()
+            print(
+                f"epoch: {epoch}, "
+                f"train loss: {training_loss / len(training_loader):.4g}, "
+                f"test loss: {test_loss:.4g} "
+                f"Time taken: {t2 - t1:.4g} s"
+            )
 
-    # Define augment stress
-    sig_aug = torch.bmm(stiff, e).squeeze(2)
+        training_loss_list.append(training_loss / len(training_loader))
+        test_loss_list.append(test_loss)
+        x.append(epoch)
 
-    # Define constitutive loss - forcing the augment stress to be equal to the neural network stress
-    loss_cons = loss_func(sig_aug, sigma)
+    t2 = timer()
+    print(f"Traing time: {t2 - t1:.4g}")
+    print(f"Train loss:{training_loss / len(training_loader)}")
+    print(f"Test loss:{test_loss}")
+    
+    ############################# Plot #############################
+    plt.figure(1)
+    plt.plot(x, training_loss_list, label='Train loss')
+    plt.plot(x, test_loss_list, label='Test loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.ylim(0, 0.05)
+    plt.legend()
+    plt.grid()
 
-    # find displacement and stress at the boundaries
-    disp_bc = disp_net(Boundary)
-    sigma_bc = stress_net(Boundary)
-    u_bc = disp_bc[:,0]
-    v_bc =
+# upon script execution
+if __name__ == '__main__':
 
-    # Compute the strain and stresses at the boundary
-    dudx_bc = torch.autograd.grad(u_bc, Boundary, grad_outputs=torch.ones_like(u_bc),create_graph=True)[0]
-    dvdx_bc =
+    # run main
+    main()
 
-    e_11_bc = dudx_bc[:,0].unsqueeze(1)
-    e_22_bc = dvdx_bc[:,1].unsqueeze(1)
-    e_12_bc =
-
-    e_bc = torch.cat((e_11_bc,e_22_bc,e_12_bc), 1)
-    e_bc = e_bc.unsqueeze(2)
-
-    sig_aug_bc = torch.bmm(stiff_bc, e_bc).squeeze(2)
-
-    # force the augment stress to agree with the NN stress at the boundary
-    loss_cons_bc = loss_func(sig_aug_bc, sigma_bc)
-
-    #============= equilibrium ===================#
-
-    sig_11 = sigma[:,0]
-    sig_22 =
-    sig_12 =
-
-    # stress equilibrium in x and y direction
-    dsig11dx = torch.autograd.grad(sig_11, x, grad_outputs=torch.ones_like(sig_11),create_graph=True)[0]
-    dsig22dx =
-    dsig12dx =
-
-    eq_x1 = dsig11dx[:,0]+dsig12dx[:,1]
-    eq_x2 =
-
-    # zero body forces
-    f_x1 = torch.zeros_like(eq_x1)
-    f_x2 = torch.zeros_like(eq_x2)
-
-    loss_eq1 = loss_func(eq_x1, f_x1)
-    loss_eq2 =
-    #========= boundary ========================#
-
-    # specify the boundary condition
-    tau_R =
-    tau_T =
-    #
-    u_L= disp_net(L_boundary)
-    u_B = disp_net(B_boundary)
-
-    sig_R = stress_net(R_boundary)
-    sig_T =
-    sig_C =
-
-    # Symmetry boundary condition left
-    loss_BC_L = loss_func(u_L[:,0], torch.zeros_like(u_L[:,0]))
-    # Symmetry boundary condition bottom
-    loss_BC_B = loss_func(u_B[:, 1], torch.zeros_like(u_B[:, 1]))
-    # Force boundary condition right
-    loss_BC_R = loss_func(sig_R[:, 0], tau_R*torch.ones_like(sig_R[:, 0])) \
-                + loss_func(sig_R[:, 2],  torch.zeros_like(sig_R[:, 2]))
-
-    loss_BC_T = + loss_func(sig_T[:, 1], tau_T*torch.ones_like(sig_T[:, 1]))   \
-                + loss_func(sig_T[:, 2],  torch.zeros_like(sig_T[:, 2]))
-
-    # traction free on circle
-    loss_BC_C = loss_func(sig_C[:,0]*C_boundary[:,0]+sig_C[:,2]*C_boundary[:,1], torch.zeros_like(sig_C[:, 0]))  \
-                + loss_func(sig_C[:,2]*C_boundary[:,0]+sig_C[:,1]*C_boundary[:,1], torch.zeros_like(sig_C[:, 0]))
-
-    # Define loss function:
-    loss = loss_eq1+loss_eq2+loss_cons+loss_BC_L+loss_BC_B+loss_BC_R+loss_BC_T+loss_BC_C+loss_cons_bc
-
-
-    # ======= uncomment below for part (e) =======================
-    # data_loss_fix
-    #x_fix = x_full[rand_index, :]
-    #u_fix = disp_net(x_fix)
-    #loss_fix = loss_func(u_fix,disp_fix)
-    #loss = loss_eq1+loss_eq2+loss_cons+loss_BC_L+loss_BC_B+loss_BC_R+loss_BC_T+loss_BC_C+loss_cons_bc + 100*loss_fix
-
-
-    loss.backward()
-    print('loss', loss, 'iter', epoch)
-    optimizer.step()
-
-
-# Plot the stress
-import matplotlib.tri as mtri
-
-stiff = E / (1 - mu ** 2) * torch.tensor([[1, mu, 0], [mu, 1, 0], [0, 0, (1 - mu) / 2]])
-stiff = stiff.unsqueeze(0)
-
-stiff_bc = stiff
-stiff_full = stiff
-stiff = torch.broadcast_to(stiff, (len(x), 3, 3))
-
-stiff_bc = torch.broadcast_to(stiff_bc, (len(Boundary), 3, 3))
-stiff_full = torch.broadcast_to(stiff_full, (len(x_full), 3, 3))
-
-u_full = disp_net(x_full)
-stress_full = stress_net(x_full)
-
-xx = x_full[:,0].detach().numpy()
-yy = x_full[:,1].detach().numpy()
-sig11 = stress_full[:,1].detach().numpy()
-
-connect =(t_connect -1).detach().numpy()
-
-triang = mtri.Triangulation(xx, yy, connect)
-
-u_11 = u_full[:,0].detach().numpy()
-
-u = u_full[:, 0]
-v = u_full[:, 1]
-
-dudx = torch.autograd.grad(u, x_full, grad_outputs=torch.ones_like(u), create_graph=True)[0]
-dvdx = torch.autograd.grad(v, x_full, grad_outputs=torch.ones_like(v), create_graph=True)[0]
-
-e_11 = dudx[:, 0].unsqueeze(1)
-e_22 = dvdx[:, 1].unsqueeze(1)
-e_12 = 0.5 * (dudx[:, 1] + dvdx[:, 0]).unsqueeze(1)
-
-e = torch.cat((e_11, e_22, e_12), 1)
-e = e.unsqueeze(2)
-
-sigma = torch.bmm(stiff_full, e).squeeze(2)
-
-plt.figure(2)
-plt.clf()
-plt.tricontourf(triang,sigma[:,0].detach().numpy())
-plt.colorbar()
-plt.show()
+    # show all plots
+    plt.show()
