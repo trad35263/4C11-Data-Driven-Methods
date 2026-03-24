@@ -1,5 +1,6 @@
 # import modules
 import matplotlib.pyplot as plt
+from matplotlib.ticker import LogLocator
 import torch
 import torch.nn as nn
 import torch.utils.data as Data
@@ -32,7 +33,7 @@ class Inputs:
     modes = 4
 
     # training variables
-    no_of_epochs = 5
+    no_of_epochs = 200
     batch_size = 20
     learning_rate = 1e-3
     weight_decay = 1e-4
@@ -121,7 +122,7 @@ class MatRead(object):
     def get_u(self):
         u_field = np.array(self.data['u_field']).T
         return torch.tensor(u_field, dtype=torch.float32)
-    
+
 # UnitGaussianNormaliser class
 class UnitGaussianNormaliser(object):
     """Stores the parameters for a pointwise Gaussian normalisation encoder and decoder."""
@@ -314,6 +315,9 @@ class Neural_net(nn.Module):
             transform = ax.transAxes, ha = 'center', va = 'bottom',
             fontsize = Inputs.titlesize
         )
+
+        # set y-axis ticks IMPORTANT
+        ax.yaxis.set_major_locator(LogLocator(base=10, numticks=5, subs=[1, 2, 5]))
 
         # tight layout
         plt.tight_layout()
@@ -655,21 +659,34 @@ class FNO(Neural_net):
 def plot_nets(nets):
     """Creates a scatter plot of the different neural network performances."""
     # create plot
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize = Inputs.figsize)
 
-    # scatter training data against number of parameters
-    ax.scatter(
-        [net.no_of_params for net in nets],
-        [net.test_loss[-1] for net in nets]
-    )
+    # group nets by label
+    labels = ["CNN", "FNO"]
+    colours = ["C0", "C1"]
 
-    ax.set_xscale('log')  # parameters vary over orders of magnitude
-    ax.set_xlabel('Number of parameters')
-    ax.set_ylabel('Final test loss')
-    ax.set_title("Neural Networks Comparison")
+    for label, colour in zip(labels, colours):
+        group = [net for net in nets if net.label == label]
+        ax.scatter(
+            [net.no_of_params for net in group],
+            [net.test_loss[-1] for net in group],
+            color = colour,
+            label = label,
+            s = 60
+        )
 
+    # configure plot
+    ax.set_xscale('log')
+    ax.set_xlabel('Number of Parameters', fontsize = Inputs.fontsize)
+    ax.set_ylabel('Final Test Loss', fontsize = Inputs.fontsize)
+    ax.set_title("Neural Networks Comparison", fontsize = Inputs.titlesize)
+    ax.grid()
+    ax.legend(fontsize = Inputs.fontsize)
+
+    # tight layout
     plt.tight_layout()
 
+    # save figure
     save_figure(fig, ax, "plot_nets")
 
 # save_figure function
@@ -718,22 +735,23 @@ def main():
         #    Inputs.no_of_layers, Inputs.input_size, Inputs.channel_width, Inputs.output_size,
         #    Inputs.dropout
         #),
+        CNN(2, None, 4, None, 0),
         CNN(2, None, 8, None, 0),
-        CNN(2, None, 16, None, 0),
-        CNN(4, None, 16, None, 0),
-        CNN(4, None, 16, None, 0.1),
+        CNN(4, None, 4, None, 0),
+        CNN(4, None, 8, None, 0),
+        CNN(6, None, 8, None, 0),
+        CNN(6, None, 8, None, 0.2),
         # example usage:
         #FNO(
         #    Inputs.no_of_layers, Inputs.input_size, Inputs.channel_width, Inputs.output_size,
         #    modes = Inputs.modes
         #)
-        FNO(2, None, 8, None, 1),
-        FNO(2, None, 8, None, 2),
-        FNO(2, None, 8, None, 4),
-        FNO(2, None, 8, None, 8),
-        FNO(4, None, 8, None, 4),
-        FNO(6, None, 8, None, 4),
-        FNO(6, None, 16, None, 4)
+        FNO(2, None, 4, None, 4),
+        FNO(2, None, 4, None, 8),
+        FNO(4, None, 4, None, 8),
+        FNO(4, None, 8, None, 8),
+        FNO(6, None, 4, None, 8),
+        FNO(6, None, 8, None, 8)
     ]
 
     # loop for each network
@@ -761,26 +779,9 @@ def main():
             Inputs.no_of_epochs, training_loader, test_loader, loss_function, optimiser, scheduler
         )
 
-        # set neural net to test mode and deactivate gradient tracking
-        """net.eval()
-        with torch.no_grad():
-
-            # calculate values predicted by the neural net
-            u_predicted = net(a_test)
-
-        # decode values and convert to numpy for plotting
-        u_true = u_normaliser.decode(u_test).numpy()
-        u_predicted = u_normaliser.decode(u_predicted).numpy()
-
-        # calculate error between ground truth and predicted
-        net.u_error = np.abs(u_true - u_predicted)"""
-
     # determine axis limits for convergence plot
     ymin = np.min([[net.test_loss, net.training_loss] for net in nets])
     ymax = np.max([[net.test_loss, net.training_loss] for net in nets])
-
-    print(f"ymin: {ymin}")
-    print(f"ymax: {ymax}")
 
     # loop for each net
     for net in nets:
@@ -789,6 +790,9 @@ def main():
         net.plot_convergence(ymin, ymax)
         net.plot_predictions(a_test, u_test, a_normaliser, u_normaliser)
 
+    # summary plot
+    plot_nets(nets)
+
 # upon script execution
 if __name__ == '__main__':
 
@@ -796,4 +800,4 @@ if __name__ == '__main__':
     main()
 
     # show all plots
-    #plt.show()
+    plt.show()
