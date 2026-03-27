@@ -5,16 +5,30 @@ import h5py
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator
 from time import perf_counter as timer
+import math
 
 # import pytorch
 import torch
 import torch.utils.data as Data
 import torch.nn as nn
-#import torch.optim as optim
 
 # import CPU monitoring modules
 import psutil
 import os
+
+# import geometry modules for plotting ellipses
+import shapely
+from scipy.spatial import cKDTree
+from shapely.geometry import Point
+from shapely.ops import unary_union
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.path import Path
+from matplotlib.patches import PathPatch
+
+# import scientific colours module
+from cmcrameri import cm
+from matplotlib.colors import LinearSegmentedColormap
 
 # import utils
 import utils
@@ -28,30 +42,43 @@ class Inputs:
     export_folder = "exports3"
 
     # number of training and test datapoints
-    training_points = 300
+    training_points = 320
+
+    # seed for random number generation
+    rng_seed = 42
 
     # down sampling factor to reduce temporal resolution
-    s = 4
+    sampling = 4
 
     # hyperparameters
-    no_of_layers = 1
+    no_of_layers = 6
     input_size = 1
     hidden_size = 8
     output_size = 1
-    no_of_hidden_layers = 1
-    channel_width = 4
-    dropout = 0
+    no_of_hidden_layers = 2
+    channel_width = 16
+    dropout = 0.01
 
     # learning parameters
-    no_of_epochs = 50
-    batch_size = 20
+    no_of_epochs = 10
+    batch_size = 40
     learning_rate = 1e-3
     step_size = 50
     gamma = 0.5
     weight_decay = 1e-4
 
+    # factor by which to multiply training dataset size via data augmentation
+    augmentation_factor = 1
+
+    # option for early stopping
+    early_stopping = True
+    patience = 50
+
+    # criteria for "correct" solution
+    delta = 0.4
+
     # plotting parameters
-    figsize = (9, 5)
+    figsize = (9, 5.5)
     fontsize = 12
     titlesize = 14
     dpi = 300
@@ -93,8 +120,12 @@ class Neural_net(nn.Module):
         # print number of epochs
         print(
             f"Start training {utils.Colours.GREEN}{self.label}{utils.Colours.END} for "
-            f"{utils.Colours.GREEN}{no_of_epochs}{utils.Colours.END} epochs...")
+            f"{utils.Colours.GREEN}{no_of_epochs}{utils.Colours.END} epochs on "
+            f"{utils.Colours.GREEN}{len(training_loader) * training_loader.batch_size}"
+            f"{utils.Colours.END} datapoints..."
+        )
         t_start = timer()
+        best_test_loss = 1e9
 
         # loop for each epoch
         for epoch in range(no_of_epochs):
@@ -102,6 +133,7 @@ class Neural_net(nn.Module):
             # set neural net to train and training loss to zero
             self.train(True)
             training_loss = 0
+            training_error = 0
 
             # loop for each entry in the training data loader
             for input, target in training_loader:
@@ -122,7 +154,7 @@ class Neural_net(nn.Module):
                 for index in range(1, input.shape[1]):
 
                     # propagate through RNO to determine stress prediction at next time step
-                    stress_predicted[:, index], self.hidden_state = self(
+                    stress_predicted[:, index], hidden_state = self(
                         input[:, index].unsqueeze(1), input[:, index - 1].unsqueeze(1),
                         hidden_state
                     )
@@ -139,6 +171,29 @@ class Neural_net(nn.Module):
                 # sum training loss
                 training_loss += loss.item()
 
+                # model errors v2
+                true_points = np.stack([input, target], axis = -1)
+                pred_points = np.stack([input, stress_predicted.detach().numpy()], axis = -1)
+
+                # calculate distances from ground truth to predicted datapoints
+                distances_fwd = np.array([
+                    cKDTree(true_points[i]).query(pred_points[i])[0]
+                    for i in range(true_points.shape[0])
+                ])
+
+                # calculate distances from predicted to ground truth datapoints
+                distances_bwd = np.array([
+                    cKDTree(pred_points[i]).query(true_points[i])[0]
+                    for i in range(true_points.shape[0])
+                ])
+
+                # get number of passed elements and test error
+                passed = (
+                    np.all(distances_fwd < Inputs.delta, axis = 1)
+                    & np.all(distances_bwd < Inputs.delta, axis = 1)
+                )
+                training_error += (~passed).sum().item()
+
             # step scheduler
             scheduler.step()
 
@@ -148,6 +203,7 @@ class Neural_net(nn.Module):
 
                 # initialise test loss as zero
                 test_loss = 0
+                test_error = 0
 
                 # loop through test data
                 for input, target in test_loader:
@@ -176,8 +232,40 @@ class Neural_net(nn.Module):
                     # update test loss
                     test_loss += loss.item()
 
+                    # model errors v2
+                    true_points = np.stack([input, target], axis = -1)
+                    pred_points = np.stack([input, stress_predicted.detach().numpy()], axis = -1)
+
+                    # query each sample — list comprehension avoids explicit for loop
+                    distances_fwd = np.array([
+                        cKDTree(true_points[i]).query(pred_points[i])[0]
+                        for i in range(true_points.shape[0])
+                    ])
+
+                    distances_bwd = np.array([
+                        cKDTree(pred_points[i]).query(true_points[i])[0]
+                        for i in range(true_points.shape[0])
+                    ])
+
+                    # get number of passed elements and test error
+                    passed = (
+                        np.all(distances_fwd < Inputs.delta, axis = 1)
+                        & np.all(distances_bwd < Inputs.delta, axis = 1)
+                    )
+                    test_error += (~passed).sum().item()
+                    self.test_passes = passed
+
             # end timer
             t = timer()
+
+            # append training and test loss
+            self.training_loss.append(training_loss / len(training_loader))
+            self.test_loss.append(test_loss / len(test_loader))
+            self.time.append(t - t_start)
+
+            # append training and test error rates
+            self.training_error_rate.append(training_error / (len(training_loader) * training_loader.batch_size))
+            self.test_error_rate.append(test_error / (len(test_loader) * test_loader.batch_size))
 
             # every Nth epoch
             if (epoch + 1) % Inputs.print_epoch == 0 or epoch == 0:
@@ -185,9 +273,15 @@ class Neural_net(nn.Module):
                 # print user feedback
                 print(
                     f"Epoch: {utils.Colours.GREEN}{epoch + 1}{utils.Colours.END}, "
-                    f"Training loss: {utils.Colours.GREEN}{training_loss / len(training_loader):.4g}"
+                    f"Training loss: {utils.Colours.GREEN}{self.training_loss[-1]:.4g}"
                     f"{utils.Colours.END}, "
-                    f"Test loss: {utils.Colours.GREEN}{test_loss / len(test_loader):.4g}{utils.Colours.END}"
+                    f"Test loss: {utils.Colours.GREEN}{self.test_loss[-1]:.4g}{utils.Colours.END}\n"
+                    f"Training error rate: {utils.Colours.GREEN}"
+                    f"{self.training_error_rate[-1]:.4g}"
+                    f"{utils.Colours.END}, "
+                    f"Test error rate: {utils.Colours.GREEN}"
+                    f"{self.test_error_rate[-1]:.4g}"
+                    f"{utils.Colours.END}"
                 )
 
                 # calculate and print memory usage to debug memory leak
@@ -199,10 +293,25 @@ class Neural_net(nn.Module):
                     f"Time remaining: {utils.Colours.GREEN}{(t - t_start) * (self.no_of_epochs / (epoch + 1) - 1):.4g}{utils.Colours.END} s, "
                 )
 
-            # append training and test loss
-            self.training_loss.append(training_loss / len(training_loader))
-            self.test_loss.append(test_loss / len(test_loader))
-            self.time.append(t - t_start)
+            # early stopping option is active
+            if Inputs.early_stopping:
+
+                # test loss is the lowest yet
+                if self.test_loss[-1] < best_test_loss:
+
+                    # store best test loss and corresponding epoch
+                    best_test_loss = self.test_loss[-1]
+                    best_epoch = epoch + 1
+
+                elif epoch + 1 - best_epoch >= Inputs.patience:
+
+                    # store truncated number of epochs and end training
+                    self.no_of_epochs = epoch + 1
+                    print(
+                        f"{utils.Colours.YELLOW}Stopping training early after {epoch + 1} epochs."
+                        f"{utils.Colours.END}"
+                    )
+                    break
 
     def plot_convergence(self, ymin = None, ymax = None):
         """Plots the convergence history of the training and testing."""
@@ -216,7 +325,7 @@ class Neural_net(nn.Module):
         # configure primary axis
         ax.grid()
         ax.set_xlabel("No. of Epochs", fontsize = Inputs.fontsize)
-        ax.set_ylabel("Loss", fontsize = Inputs.fontsize)
+        ax.set_ylabel("Final MSE Loss", fontsize = Inputs.fontsize)
         ax.set_yscale("log")
 
         # axis bounds are given as input arguments
@@ -246,20 +355,25 @@ class Neural_net(nn.Module):
         title_text = f"{self.label} | Layers: {self.no_of_layers} | Parameters: {self.no_of_params}"
         for quantity in self.quantities:
 
+            # append quantities relevant to network to title text
             title_text += f" | {quantity[1]}: {getattr(self, quantity[0])}"
         
+        # append number of training datapoints
+        title_text += f"\nTraining datapoints: {Inputs.training_points * Inputs.augmentation_factor}"
+        
         # set title
-        ax.text(
+        """ax.text(
             0.5, 1.03, title_text,
             transform = ax.transAxes, ha = 'center', va = 'bottom',
             fontsize = Inputs.titlesize
-        )
+        )"""
+        ax.set_title(title_text, fontsize = Inputs.titlesize)
 
         # set y-axis ticks IMPORTANT
         ax.yaxis.set_major_locator(LogLocator(base=10, numticks=5, subs=[1, 2, 5]))
 
         # tight layout
-        plt.tight_layout()
+        fig.tight_layout()
 
         # construct filename
         filename = (
@@ -328,11 +442,17 @@ class RNO(Neural_net):
                 # append non-linear activation function
                 self.hidden_layers.append(nn.SELU())
 
+        # add a dropout module
+        self.dropout_layer = nn.Dropout(p = dropout)
+
+        # lists for storing accuracy values
+        self.training_error_rate = []
+        self.test_error_rate = []
+
         # give label for plotting
         self.label = "RNO"
         self.quantities = [
-            ["no_of_hidden_layers", "No. of Hidden Layers"],
-            ["channel_width", "Channel Width"],
+            ["no_of_hidden_layers", "Hidden Layers"],
             ["dropout", "Dropout"]
         ]
 
@@ -347,6 +467,12 @@ class RNO(Neural_net):
             # update rate of change of hidden state
             dh_dt = hidden_layer(dh_dt)
 
+            # after a non-linear activation
+            if isinstance(hidden_layer, nn.SELU):
+
+                # apply dropout
+                dh_dt = self.dropout_layer(dh_dt)
+
         # update hidden state via Euler integration
         hidden_state = dh_dt * self.dt + hidden_state
 
@@ -359,39 +485,331 @@ class RNO(Neural_net):
             # pass intermediate tensor through layer
             x = layer(x)
 
+            # after a non-linear activation
+            if isinstance(layer, nn.SELU):
+
+                # apply dropout
+                x = self.dropout_layer(x)
+
         # return output
         output = x.squeeze(1)
         return output, hidden_state
 
-    def initHidden(self,b_size):
-        """Returns a tensor of zeros with size equal to (batch_size, hidden_size)."""
-        return torch.zeros(b_size, self.hidden_size)
-    
-# DenseNet class
-class DenseNet(nn.Module):
-    """Stores parameters relevant to the RNO model."""
-    def __init__(self, layers, nonlinearity):
-        """Creates an instance of the DenseNet class."""
-        # instantiate parent class
-        super(DenseNet, self).__init__()
+    def plot_error_rate(self, emin = None, emax = None):
+        """Plots the error rate history over the training process."""
+        # create plot
+        fig, ax = plt.subplots(figsize = Inputs.figsize)
+        
+        # plot training and test loss against epoch
+        ax.plot(np.arange(self.no_of_epochs), self.training_error_rate, label = "Training")
+        ax.plot(np.arange(self.no_of_epochs), self.test_error_rate, label = "Test")
 
-        self.n_layers = len(layers) - 1
+        # configure primary axis
+        ax.grid()
+        ax.set_xlabel("No. of Epochs", fontsize = Inputs.fontsize)
+        ax.set_ylabel("Error Rate", fontsize = Inputs.fontsize)
 
-        assert self.n_layers >= 1
+        # create twin y axis for time
+        ax_time = ax.twinx()
+        ax_time.plot(
+            np.arange(self.no_of_epochs), self.time,
+            color = 'grey', linestyle = '--', alpha = 0.5, label = "Time"
+        )
+        ax_time.set_ylabel("Time (s)", fontsize = Inputs.fontsize)
+        ax_time.tick_params(axis = 'y')
 
-        self.layers = nn.ModuleList()
+        # combine legends from both axes
+        lines_loss, labels_loss = ax.get_legend_handles_labels()
+        lines_time, labels_time = ax_time.get_legend_handles_labels()
+        ax.legend(
+            lines_loss + lines_time, labels_loss + labels_time, loc = "center left",
+            bbox_to_anchor = (1.1, 0.5), fontsize = Inputs.fontsize
+        )
 
-        for j in range(self.n_layers):
-            self.layers.append(nn.Linear(layers[j], layers[j + 1]))
+        # axis limits are provided
+        if emin is not None and emax is not None:
 
-            if j != self.n_layers - 1:
-                self.layers.append(nonlinearity())
+            # set axis limits
+            ax.set_ylim(emin, emax)
 
-    def forward(self, x):
-        for _, l in enumerate(self.layers):
-            x = l(x)
+        # determine title text
+        title_text = f"{self.label} | Layers: {self.no_of_layers} | Parameters: {self.no_of_params}"
+        for quantity in self.quantities:
 
-        return x
+            # append quantities relevant to network to title text
+            title_text += f" | {quantity[1]}: {getattr(self, quantity[0])}"
+
+        # append number of training datapoints
+        title_text += f"\nTraining datapoints: {Inputs.training_points * Inputs.augmentation_factor}"
+        
+        # set title
+        ax.set_title(title_text, fontsize = Inputs.titlesize)
+
+        # tight layout
+        fig.tight_layout()
+
+        # construct filename
+        filename = (
+            f"plot_error_rate_{self.label}_layers_{self.no_of_layers}_parameters_"
+            f"{self.no_of_params}_epochs_{self.no_of_epochs}"
+        )
+        for quantity in self.quantities:
+
+            filename += f"_{quantity[0]}_{getattr(self, quantity[0])}"
+
+        # replace all decimal points in the file name
+        filename = filename.replace(".", "_")
+
+        # save figure
+        save_figure(fig, ax, filename)
+
+    def plot_predictions(self, test_set, loss_function, input_normaliser, output_normaliser, plots = 6):
+        """Plots the ground truth stress values against those predicted by the RNO."""
+        # determine number of rows and columns
+        for i in range(math.isqrt(plots), 0, -1):
+            if plots % i == 0:
+                rows = i
+                break
+
+        # calculate number of columns
+        columns = int(plots / rows)
+        
+        # create plot
+        width, height = Inputs.figsize
+        fig, axes = plt.subplots(rows, columns, figsize = (width * columns / 3, height * rows / 2))
+
+        # get 6 random indices of test data
+        rng = np.random.default_rng(Inputs.rng_seed)
+        indices = rng.choice(len(test_set), size = plots, replace = False)
+        indices.sort()
+
+        # initialise fresh hidden state
+        hidden_state = torch.zeros(plots, self.hidden_size)
+
+        # preallocate tensor of stress predictions
+        stress_predicted = torch.zeros(plots, test_set[0][0].shape[0])
+
+        # get inputs and targets from selected indices of test set
+        input, target = test_set[indices][0], test_set[indices][1]
+
+        # apply "warm start" where stress state at t = 0 is given by initial conditions
+        stress_predicted[:, 0] = target[:, 0]
+
+        # set neural net to test mode and deactivate gradient tracking
+        self.eval()
+        with torch.no_grad():
+
+            # loop for each time step (starting at t = dt)
+            for index in range(1, input.shape[1]):
+
+                # propagate through RNO to determine stress prediction at next time step
+                stress_predicted[:, index], self.hidden_state = self(
+                    input[:, index].unsqueeze(1), input[:, index - 1].unsqueeze(1),
+                    hidden_state
+                )
+
+            # calculate loss for each sample
+            losses = [loss_function(x, y).item() for (x, y) in zip(stress_predicted, target)]
+
+        # get list of bands corresponding to passing region in normalised stress-strain space
+        bands = [
+            unary_union([
+                Point(strain, stress).buffer(Inputs.delta)
+                for strain, stress in zip(input.detach().numpy()[i], target.detach().numpy()[i])
+            ])
+            for i in range(input.shape[0])
+        ]
+
+        # convert tensors to numpy arrays
+        input = input_normaliser.decode(input)
+        target = output_normaliser.decode(target)
+        stress_predicted = output_normaliser.decode(stress_predicted)
+
+        # calculate plot axis limits
+        x_min, x_max = input.min(), input.max()
+        y_min = min(target.min(), stress_predicted.min())
+        y_max = max(target.max(), stress_predicted.max())
+        margin = 0.1
+
+        # loop for each row of subplots
+        for i, row in enumerate(axes):
+
+            # set y-axis label for LH column of plots
+            row[0].set_ylabel("Stress (Pa)")
+
+            # loop for each subplot in row
+            for j, ax in enumerate(row):
+
+                # plot ground truth and predicted solutions
+                ax.plot(input[i * len(row) + j, :], target[i * len(row) + j, :], marker = '.', markersize = 2)
+                ax.plot(
+                    input[i * len(row) + j, :], stress_predicted[i * len(row) + j, :],
+                    marker = '.', markersize = 2,
+                    label = f"Loss: {losses[i * len(row) + j]:.3g}"
+                )
+
+                # get band
+                band = bands[i * len(row) + j]
+
+                # handle case where band is non-contiguous
+                if band.geom_type == "Polygon":
+                    geoms = [band]
+                else:
+                    geoms = list(band.geoms)
+
+                # loop for each contiguous geometry
+                for geom in geoms:
+
+                    # get x- and y-coordinates
+                    xs, ys = geom.exterior.xy
+
+                    # scale geometry back to original space
+                    scaled_geom = shapely.affinity.scale(
+                        geom,
+                        xfact=input_normaliser.std.item(),
+                        yfact=output_normaliser.std.item(),
+                        origin=(0, 0)
+                    )
+
+                    patch = geom_to_patch(
+                        scaled_geom,
+                        alpha=0.2,
+                        facecolor="green" if self.test_passes[indices][i * len(row) + j] else "red",
+                        edgecolor="none"
+                    )
+                    ax.add_patch(patch)
+
+                # configure plot
+                ax.set_title(
+                    f"Sample {indices[i * len(row) + j] + 1}", fontsize = Inputs.fontsize,
+                    fontweight = "bold"
+                )
+                ax.set_xlim(x_min - margin * (x_max - x_min), x_max + margin * (x_max - x_min))
+                ax.set_ylim(y_min - margin * (y_max - y_min), y_max + margin * (y_max - y_min))
+                ax.set_box_aspect(1)
+                ax.grid()
+                ax.legend()
+
+                # subplot is in bottom row
+                if i == len(axes) - 1:
+
+                    # set x-axis label for bottom row of plots
+                    ax.set_xlabel("Strain")
+
+        # determine title text
+        title_text = (
+            f"{self.label} | Layers: {self.no_of_layers} | Parameters: {self.no_of_params} | "
+            f"No. of Epochs: {self.no_of_epochs}"
+        )
+        for quantity in self.quantities:
+
+            title_text += f" | {quantity[1]}: {getattr(self, quantity[0])}"
+
+        title_text += f"\nTraining datapoints: {Inputs.training_points * Inputs.augmentation_factor}"
+        
+        # set title
+        fig.suptitle(title_text, fontsize = Inputs.titlesize)
+
+        # tight layout
+        fig.tight_layout()
+
+        # construct filename
+        filename = (
+            f"plot_predictions_{self.label}_layers_{self.no_of_layers}_parameters_"
+            f"{self.no_of_params}_epochs_{self.no_of_epochs}"
+        )
+        for quantity in self.quantities:
+
+            filename += f"_{quantity[0]}_{getattr(self, quantity[0])}"
+
+        # replace all decimal points in the file name
+        filename = filename.replace(".", "_")
+
+        # save figure
+        save_figure(fig, ax, filename)
+
+    def plot_loss_against_time(self, test_set, ymin = None, ymax = None):
+        """Plots the cumulative mean MSE loss for each test case against time."""
+        # create plot
+        fig, ax = plt.subplots(figsize = Inputs.figsize)
+
+        # initialise fresh hidden state
+        hidden_state = torch.zeros(len(test_set), self.hidden_size)
+
+        # preallocate tensor of stress predictions
+        stress_predicted = torch.zeros(len(test_set), test_set[0][0].shape[0])
+
+        # get inputs and targets from selected indices of test set
+        input, target = test_set.tensors
+
+        # apply "warm start" where stress state at t = 0 is given by initial conditions
+        stress_predicted[:, 0] = target[:, 0]
+
+        # set neural net to test mode and deactivate gradient tracking
+        self.eval()
+        with torch.no_grad():
+
+            # loop for each time step (starting at t = dt)
+            for index in range(1, input.shape[1]):
+
+                # propagate through RNO to determine stress prediction at next time step
+                stress_predicted[:, index], self.hidden_state = self(
+                    input[:, index].unsqueeze(1), input[:, index - 1].unsqueeze(1),
+                    hidden_state
+                )
+
+        # calculate loss as a function of time for each sample
+        loss_matrix = (stress_predicted.detach().numpy() - target.detach().numpy())**2
+
+        # get array of steps and cumulative mean for each sample
+        steps = np.arange(1, loss_matrix.shape[1] + 1).reshape(1, -1)
+        cumulative_mean = np.cumsum(loss_matrix, axis = 1) / steps
+
+        # sort by final cumulative mean value, highest to lowest
+        sort_indices = np.argsort(cumulative_mean[:, -1])[::-1]
+        cumulative_mean = cumulative_mean[sort_indices]
+
+        #from matplotlib import colormaps
+        #print(f"list(colormaps): {list(colormaps)}")
+
+        # get list of colours
+        colours = plt.cm.viridis(np.linspace(0, 1, len(loss_matrix)))
+        #colours = cm.devon(np.linspace(0, 1, len(loss_matrix)))
+
+        # loop for each test sample
+        for index, losses in enumerate(loss_matrix):
+
+            # plot cumulative mean
+            ax.plot(
+                np.arange(len(losses)), cumulative_mean[index], color = colours[index], 
+                linewidth = 1,
+                alpha = 0.5
+            )
+
+        # configure plot
+        ax.grid()
+        ax.set_xlabel("Time Step", fontsize = Inputs.fontsize)
+        ax.set_ylabel("Cumulative Mean MSE Loss", fontsize = Inputs.fontsize)
+        ax.set_yscale("log")
+
+        # axis limits are provided
+        if ymin is not None and ymax is not None:
+
+            # set axis limits
+            ax.set_ylim(ymin, ymax)
+
+        # determine title text
+        title_text = (
+            f"{self.label} | Layers: {self.no_of_layers} | Parameters: {self.no_of_params} | "
+            f"No. of Epochs: {self.no_of_epochs}"
+        )
+        for quantity in self.quantities:
+
+            title_text += f" | {quantity[1]}: {getattr(self, quantity[0])}"
+
+        title_text += f"\nTraining datapoints: {Inputs.training_points * Inputs.augmentation_factor}"
+
+        ax.set_title(title_text, fontsize = Inputs.titlesize)
 
 class MatReader(object):
     def __init__(self, file_path, to_torch=True, to_cuda=False, to_float=True):
@@ -438,15 +856,6 @@ class MatReader(object):
 
         return x
 
-    def set_cuda(self, to_cuda):
-        self.to_cuda = to_cuda
-
-    def set_torch(self, to_torch):
-        self.to_torch = to_torch
-
-    def set_float(self, to_float):
-        self.to_float = to_float
-
 # Normaliser class
 class Normaliser():
     """Stores the parameters for a Z-score normalisation encoder and decoder."""
@@ -467,7 +876,142 @@ class Normaliser():
     def decode(self, x):
         """Reverses the normalisation and returns the original input."""
         x = x * (self.std + self.eps) + self.mean
-        return x
+        return x.detach().numpy()
+
+def augment_data(data_set, alpha=0.4):
+    """
+    Principled Global Mixup:
+    - Uses Beta distribution for interpolation weights.
+    - Shuffles the entire dataset for each 'round' of augmentation.
+    - Vectorized for speed.
+    """
+    if Inputs.augmentation_factor <= 1:
+        return data_set
+        
+    # 1. Setup local Generators for reproducibility
+    # This ensures we don't rely on global state
+    rng_np = np.random.default_rng(seed=Inputs.rng_seed)
+    # For PyTorch, we create a generator object for randperm
+    rng_torch = torch.Generator()
+    rng_torch.manual_seed(Inputs.rng_seed)
+
+    # 1. Extract raw tensors
+    inputs_all, targets_all = data_set.tensors
+    N, D = inputs_all.shape
+    
+    all_inputs = [inputs_all]
+    all_targets = [targets_all]
+
+    # 2. Generate (factor - 1) new versions of the dataset
+    for _ in range(Inputs.augmentation_factor - 1):
+        # Create a random permutation to find 'partners' for every row
+        perm = torch.randperm(N, generator=rng_torch)
+        
+        # Draw weights from a Beta distribution (principled approach)
+        # We generate N weights, one for each pair-mix
+        r = rng_np.beta(alpha, alpha, size=(N, 1))
+        r = torch.from_numpy(r).float()
+        
+        # Linear combination: mix original [i] with shuffled [perm[i]]
+        mixed_in = r * inputs_all + (1 - r) * inputs_all[perm]
+        mixed_tar = r * targets_all + (1 - r) * targets_all[perm]
+        
+        all_inputs.append(mixed_in)
+        all_targets.append(mixed_tar)
+
+    # 3. Concatenate and return
+    final_input = torch.cat(all_inputs, dim=0)
+    final_target = torch.cat(all_targets, dim=0)
+
+    return Data.TensorDataset(final_input, final_target)
+
+def geom_to_patch(geom, **kwargs):
+    """Converts a Shapely Polygon (with holes) to a matplotlib PathPatch."""
+    
+    def ring_to_path_coords(ring):
+        coords = np.array(ring.coords)
+        codes = [Path.MOVETO] + [Path.LINETO] * (len(coords) - 2) + [Path.CLOSEPOLY]
+        return coords, codes
+
+    all_coords = []
+    all_codes = []
+
+    # exterior ring
+    coords, codes = ring_to_path_coords(geom.exterior)
+    all_coords.append(coords)
+    all_codes.extend(codes)
+
+    # interior rings (holes)
+    for interior in geom.interiors:
+        coords, codes = ring_to_path_coords(interior)
+        all_coords.append(coords)
+        all_codes.extend(codes)
+
+    path = Path(np.concatenate(all_coords), all_codes)
+    return PathPatch(path, **kwargs)
+
+# plot_nets function
+def plot_nets(nets):
+    """Creates a scatter plot of the different neural network performances."""
+    # create plots
+    fig, axes = plt.subplots(2, 1, figsize = Inputs.figsize)
+
+    # group nets by label
+    dropouts = []
+    labels = []
+    colours = []
+
+    # loop for each neural network
+    for net in nets:
+
+        # dropout is not yet stored list
+        if not net.dropout in dropouts:
+
+            # append dropout, label and a new colour
+            dropouts.append(net.dropout)
+            labels.append(f"p = {net.dropout}")
+            colours.append(f"C{len(colours)}")
+
+    # for each dropout value found
+    for dropout, label, colour in zip(dropouts, labels, colours):
+
+        # form group of neural networks and plot test loss and test error rate
+        group = [net for net in nets if net.dropout == dropout]
+        axes[0].scatter(
+            [net.no_of_params for net in group],
+            [net.test_loss[-1] for net in group],
+            color = colour,
+            label = label,
+            s = 60
+        )
+        axes[1].scatter(
+            [net.no_of_params for net in group],
+            [net.test_error_rate[-1] for net in group],
+            color = colour,
+            label = label,
+            s = 60
+        )
+
+    # configure plot
+    axes[0].set_xscale("log")
+    axes[1].set_xscale("log")
+    axes[0].set_yscale("log")
+    axes[1].set_xlabel('Number of Parameters', fontsize = Inputs.fontsize)
+    axes[0].set_ylabel('Final MSE Test Loss', fontsize = Inputs.fontsize)
+    axes[1].set_ylabel('Final Test Error Rate', fontsize = Inputs.fontsize)
+    fig.suptitle(
+        "Neural Networks Comparison"
+        f"\nTraining datapoints: {Inputs.training_points * Inputs.augmentation_factor}",
+        fontsize = Inputs.titlesize)
+    axes[0].grid()
+    axes[1].grid()
+    axes[1].legend(fontsize = Inputs.fontsize)
+
+    # tight layout
+    fig.tight_layout()
+
+    # save figure
+    save_figure(fig, axes, "plot_nets")
 
 # save_figure function
 def save_figure(fig, ax, filename):
@@ -478,6 +1022,9 @@ def save_figure(fig, ax, filename):
 # main function
 def main():
 
+    # set pyTorch and numpy seeds
+    torch.manual_seed(Inputs.rng_seed)
+
     # load data
     data_loader = MatReader(Inputs.data_folder + "/" + Inputs.file_name)
 
@@ -487,21 +1034,38 @@ def main():
     data_output = data_loader.read_field("sigma_tol").contiguous().view(n_total, -1)
 
     # down sample the data to reduce temporal resolution
-    data_input = data_input[:, 0::Inputs.s]
-    data_output = data_output[:, 0::Inputs.s]
+    data_input = data_input[:, 0::Inputs.sampling]
+    data_output = data_output[:, 0::Inputs.sampling]
 
-    # normalise data
-    input_normaliser = Normaliser(data_input)
-    output_normaliser = Normaliser(data_output)
+    # shuffle input and output data randomly
+    rng = np.random.default_rng(Inputs.rng_seed)
+    indices = rng.choice(len(data_input), size = len(data_input), replace = False)
+    data_input = data_input[indices]
+    data_output = data_output[indices]
+
+    # normalise data (based on training data only)
+    input_normaliser = Normaliser(data_input[:Inputs.training_points, :])
+    output_normaliser = Normaliser(data_output[:Inputs.training_points, :])
     data_input = input_normaliser.encode(data_input)
     data_output = output_normaliser.encode(data_output)
 
+    # set RNG seed for DataLoader shuffling
+    g = torch.Generator()
+    g.manual_seed(Inputs.rng_seed)
+
     # create training data loader
-    training_set = Data.TensorDataset(data_input[:Inputs.training_points, :], data_output[:Inputs.training_points, :])
-    training_loader = Data.DataLoader(training_set, Inputs.batch_size, shuffle = True)
+    training_set = Data.TensorDataset(
+        data_input[:Inputs.training_points, :], data_output[:Inputs.training_points, :]
+    )
+    training_set = augment_data(training_set)
+    training_loader = Data.DataLoader(
+        training_set, Inputs.batch_size, shuffle = True, generator = g, num_workers = 0
+    )
 
     # create test data loader with batch size equal to entire test dataset
-    test_set = Data.TensorDataset(data_input[Inputs.training_points:, :], data_output[Inputs.training_points:, :])
+    test_set = Data.TensorDataset(
+        data_input[Inputs.training_points:, :], data_output[Inputs.training_points:, :]
+    )
     test_loader = Data.DataLoader(test_set, len(test_set), shuffle = False)
 
     # define time increment to use
@@ -510,28 +1074,67 @@ def main():
     # define loss function
     loss_function = nn.MSELoss()
 
+    # get list of networks to train
+    nets = []
+    dropouts = [0, 0.02, 0.05]
+    sizes = [4, 8, 16]
+    for p in dropouts:
+
+        for size in sizes:
+
+            nets.append(
+                RNO(
+                    Inputs.no_of_layers, Inputs.input_size, size, Inputs.output_size,
+                    Inputs.no_of_hidden_layers, size, p, dt
+                )
+            )
+
     # create neural network instance
-    net = RNO(
+    """nets = [RNO(
         Inputs.no_of_layers, Inputs.input_size, Inputs.hidden_size, Inputs.output_size,
         Inputs.no_of_hidden_layers, Inputs.channel_width, Inputs.dropout, dt
-    )
+    )]"""
 
-    # print number of parameters
-    net.print_params()
+    # loop for each network in list
+    for net in nets:
 
-    # define optimiser and scheduler
-    optimiser = torch.optim.Adam(net.parameters(), lr = Inputs.learning_rate)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimiser, step_size = Inputs.step_size, gamma = Inputs.gamma
-    )
+        # print number of parameters
+        net.print_params()
 
-    # train neural network
-    net.training_loop(
-        Inputs.no_of_epochs, training_loader, test_loader, loss_function, optimiser, scheduler
-    )
+        # define optimiser and scheduler
+        optimiser = torch.optim.AdamW(
+            net.parameters(), lr = Inputs.learning_rate, weight_decay = Inputs.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimiser, step_size = Inputs.step_size, gamma = Inputs.gamma
+        )
 
-    # plot convergence history
-    net.plot_convergence()
+        # train neural network
+        net.training_loop(
+            Inputs.no_of_epochs, training_loader, test_loader, loss_function, optimiser, scheduler
+        )
+
+    # determine axis limits for convergence plot
+    ymin = np.min([[net.test_loss, net.training_loss] for net in nets])
+    ymax = np.max([[net.test_loss, net.training_loss] for net in nets])
+
+    # determine axis limits for error rate plot
+    emin = np.min([[net.test_error_rate, net.training_error_rate] for net in nets])
+    emax = np.max([[net.test_error_rate, net.training_error_rate] for net in nets])
+    margin = 0.1
+
+    # loop for each network in list
+    for net in nets:
+
+        # plot convergence history
+        net.plot_convergence(0.5 * ymin, 1.2 * ymax)
+        net.plot_error_rate(emin - margin * (emax - emin), emax + margin * (emax - emin))
+
+        # plot predictions
+        net.plot_predictions(test_set, loss_function, input_normaliser, output_normaliser)
+        net.plot_loss_against_time(test_set, 0.5 * ymin, 1.2 * ymax)
+
+    plot_nets(nets)
 
 # upon script execution
 if __name__ == "__main__":
