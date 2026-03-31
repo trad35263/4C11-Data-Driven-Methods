@@ -3,7 +3,7 @@ import numpy as np
 import scipy.io
 import h5py
 import matplotlib.pyplot as plt
-from matplotlib.ticker import LogLocator
+from matplotlib.ticker import LogLocator, LogFormatterMathtext, LogFormatterSciNotation
 from time import perf_counter as timer
 import math
 
@@ -11,6 +11,7 @@ import math
 import torch
 import torch.utils.data as Data
 import torch.nn as nn
+from torch.profiler import profile, record_function, ProfilerActivity
 
 # import CPU monitoring modules
 import psutil
@@ -30,7 +31,11 @@ from matplotlib.patches import PathPatch
 from cmcrameri import cm
 from matplotlib.colors import LinearSegmentedColormap
 
-# import utils
+# colours modules
+import matplotlib.colors as mcolors
+import colorsys
+
+# import utils (contains Colours class)
 import utils
 
 # Inputs class
@@ -48,19 +53,19 @@ class Inputs:
     rng_seed = 42
 
     # down sampling factor to reduce temporal resolution
-    sampling = 4
+    sampling = 8
 
-    # hyperparameters
+    # default hyperparameters
     no_of_layers = 6
     input_size = 1
     hidden_size = 8
     output_size = 1
-    no_of_hidden_layers = 2
+    no_of_hidden_layers = 3
     channel_width = 16
     dropout = 0.01
 
     # learning parameters
-    no_of_epochs = 10
+    no_of_epochs = 500
     batch_size = 40
     learning_rate = 1e-3
     step_size = 50
@@ -68,23 +73,26 @@ class Inputs:
     weight_decay = 1e-4
 
     # factor by which to multiply training dataset size via data augmentation
-    augmentation_factor = 1
+    augmentation_factor = 2
 
     # option for early stopping
-    early_stopping = True
+    early_stopping = False
     patience = 50
 
-    # criteria for "correct" solution
-    delta = 0.4
+    # criterion for "correct" solution (in standard deviations)
+    delta = 0.5
 
     # plotting parameters
-    figsize = (9, 5.5)
+    figsize = (10, 6)
     fontsize = 12
     titlesize = 14
     dpi = 300
 
     # terminal output parameters
-    print_epoch = 5
+    print_epoch = 10
+
+    # flag for showing plots
+    show_plots_flag = False
 
 # Neural_net class
 class Neural_net(nn.Module):
@@ -362,11 +370,6 @@ class Neural_net(nn.Module):
         title_text += f"\nTraining datapoints: {Inputs.training_points * Inputs.augmentation_factor}"
         
         # set title
-        """ax.text(
-            0.5, 1.03, title_text,
-            transform = ax.transAxes, ha = 'center', va = 'bottom',
-            fontsize = Inputs.titlesize
-        )"""
         ax.set_title(title_text, fontsize = Inputs.titlesize)
 
         # set y-axis ticks IMPORTANT
@@ -671,6 +674,7 @@ class RNO(Neural_net):
                         origin=(0, 0)
                     )
 
+                    # add patch
                     patch = geom_to_patch(
                         scaled_geom,
                         alpha=0.2,
@@ -789,7 +793,7 @@ class RNO(Neural_net):
         # configure plot
         ax.grid()
         ax.set_xlabel("Time Step", fontsize = Inputs.fontsize)
-        ax.set_ylabel("Cumulative Mean MSE Loss", fontsize = Inputs.fontsize)
+        ax.set_ylabel("Cumulative Mean MSE Test Loss", fontsize = Inputs.fontsize)
         ax.set_yscale("log")
 
         # axis limits are provided
@@ -810,6 +814,21 @@ class RNO(Neural_net):
         title_text += f"\nTraining datapoints: {Inputs.training_points * Inputs.augmentation_factor}"
 
         ax.set_title(title_text, fontsize = Inputs.titlesize)
+
+        # construct filename
+        filename = (
+            f"plot_loss_against_time_{self.label}_layers_{self.no_of_layers}_parameters_"
+            f"{self.no_of_params}_epochs_{self.no_of_epochs}"
+        )
+        for quantity in self.quantities:
+
+            filename += f"_{quantity[0]}_{getattr(self, quantity[0])}"
+
+        # replace all decimal points in the file name
+        filename = filename.replace(".", "_")
+
+        # save figure
+        save_figure(fig, ax, filename)
 
 class MatReader(object):
     def __init__(self, file_path, to_torch=True, to_cuda=False, to_float=True):
@@ -878,51 +897,48 @@ class Normaliser():
         x = x * (self.std + self.eps) + self.mean
         return x.detach().numpy()
 
-def augment_data(data_set, alpha=0.4):
-    """
-    Principled Global Mixup:
-    - Uses Beta distribution for interpolation weights.
-    - Shuffles the entire dataset for each 'round' of augmentation.
-    - Vectorized for speed.
-    """
+def augment_data(data_set, alpha = 0.2):
+    """Applies a principled global mixup using a Beta distribution for interpolation weights."""
+    # no data augmentation is required
     if Inputs.augmentation_factor <= 1:
+
+        # return dataset as is
         return data_set
         
-    # 1. Setup local Generators for reproducibility
-    # This ensures we don't rely on global state
-    rng_np = np.random.default_rng(seed=Inputs.rng_seed)
-    # For PyTorch, we create a generator object for randperm
+    # setup local Generators for reproducibility
+    rng_np = np.random.default_rng(seed = Inputs.rng_seed)
     rng_torch = torch.Generator()
     rng_torch.manual_seed(Inputs.rng_seed)
 
-    # 1. Extract raw tensors
+    # extract raw tensors
     inputs_all, targets_all = data_set.tensors
-    N, D = inputs_all.shape
+    N, _ = inputs_all.shape
     
+    # store as lists
     all_inputs = [inputs_all]
     all_targets = [targets_all]
 
-    # 2. Generate (factor - 1) new versions of the dataset
+    # loop for each new version of the dataset required
     for _ in range(Inputs.augmentation_factor - 1):
-        # Create a random permutation to find 'partners' for every row
-        perm = torch.randperm(N, generator=rng_torch)
+
+        # create a random permutation to find partners for every sample
+        perm = torch.randperm(N, generator = rng_torch)
         
-        # Draw weights from a Beta distribution (principled approach)
-        # We generate N weights, one for each pair-mix
-        r = rng_np.beta(alpha, alpha, size=(N, 1))
+        # draw weights from a Beta distribution for each pair of samples
+        r = rng_np.beta(alpha, alpha, size = (N, 1))
         r = torch.from_numpy(r).float()
         
-        # Linear combination: mix original [i] with shuffled [perm[i]]
-        mixed_in = r * inputs_all + (1 - r) * inputs_all[perm]
-        mixed_tar = r * targets_all + (1 - r) * targets_all[perm]
+        # apply linear combination
+        mixed_inputs = r * inputs_all + (1 - r) * inputs_all[perm]
+        mixed_targets = r * targets_all + (1 - r) * targets_all[perm]
         
-        all_inputs.append(mixed_in)
-        all_targets.append(mixed_tar)
+        # append to dataset
+        all_inputs.append(mixed_inputs)
+        all_targets.append(mixed_targets)
 
-    # 3. Concatenate and return
+    # concatenate and return
     final_input = torch.cat(all_inputs, dim=0)
     final_target = torch.cat(all_targets, dim=0)
-
     return Data.TensorDataset(final_input, final_target)
 
 def geom_to_patch(geom, **kwargs):
@@ -953,11 +969,30 @@ def geom_to_patch(geom, **kwargs):
 # plot_nets function
 def plot_nets(nets):
     """Creates a scatter plot of the different neural network performances."""
+    # helper function
+    def adjust_lightness(color, amount):
+        """amount < 1 darkens, amount > 1 lightens. 1.0 = unchanged."""
+        c = colorsys.rgb_to_hls(*mcolors.to_rgb(color))
+        return colorsys.hls_to_rgb(c[0], max(0, min(1, amount * c[1])), c[2])
+
     # create plots
     fig, axes = plt.subplots(2, 1, figsize = Inputs.figsize)
 
+    # Build mappings
+    unique_layers = sorted(set(net.no_of_layers for net in nets))
+    unique_dropouts = sorted(set(net.dropout for net in nets))
+
+    # set base colours
+    base_colours = {layers: f"C{i}" for i, layers in enumerate(unique_layers)}
+    swap = {"C1": "C3", "C3": "C1"}
+    base_colours = {layers: swap.get(colour, colour) for layers, colour in base_colours.items()}
+
+    # set "lightness" values
+    lightness_values = {d: 1 + (i / max(len(unique_dropouts) - 1, 1)) * 0.7
+                    for i, d in enumerate(unique_dropouts)}
+
     # group nets by label
-    dropouts = []
+    layers_dropouts = []
     labels = []
     colours = []
 
@@ -965,37 +1000,40 @@ def plot_nets(nets):
     for net in nets:
 
         # dropout is not yet stored list
-        if not net.dropout in dropouts:
+        if not (net.no_of_layers, net.dropout) in layers_dropouts:
 
             # append dropout, label and a new colour
-            dropouts.append(net.dropout)
-            labels.append(f"p = {net.dropout}")
-            colours.append(f"C{len(colours)}")
+            layers_dropouts.append((net.no_of_layers, net.dropout))
+            labels.append(f"Layers = {net.no_of_layers}, p = {net.dropout}")
+            colours.append(adjust_lightness(base_colours[net.no_of_layers], lightness_values[net.dropout]))
 
     # for each dropout value found
-    for dropout, label, colour in zip(dropouts, labels, colours):
+    for (no_of_layers, dropout), label, colour in zip(layers_dropouts, labels, colours):
 
         # form group of neural networks and plot test loss and test error rate
-        group = [net for net in nets if net.dropout == dropout]
+        group = [net for net in nets if net.no_of_layers == no_of_layers and net.dropout == dropout]
         axes[0].scatter(
             [net.no_of_params for net in group],
             [net.test_loss[-1] for net in group],
             color = colour,
             label = label,
-            s = 60
+            s = 60 if dropout == 0 else np.pi * 15,
+            marker = 'o' if dropout == 0 else 's'
         )
         axes[1].scatter(
             [net.no_of_params for net in group],
             [net.test_error_rate[-1] for net in group],
             color = colour,
             label = label,
-            s = 60
+            s = 60 if dropout == 0 else np.pi * 15,
+            marker = 'o' if dropout == 0 else 's'
         )
 
     # configure plot
     axes[0].set_xscale("log")
     axes[1].set_xscale("log")
     axes[0].set_yscale("log")
+    axes[1].set_ylim(-0.05, 1.05)
     axes[1].set_xlabel('Number of Parameters', fontsize = Inputs.fontsize)
     axes[0].set_ylabel('Final MSE Test Loss', fontsize = Inputs.fontsize)
     axes[1].set_ylabel('Final Test Error Rate', fontsize = Inputs.fontsize)
@@ -1006,6 +1044,9 @@ def plot_nets(nets):
     axes[0].grid()
     axes[1].grid()
     axes[1].legend(fontsize = Inputs.fontsize)
+
+    # set y-axis ticks IMPORTANT
+    axes[0].yaxis.set_major_locator(LogLocator(base=10, numticks=5, subs=[1, 2, 5]))
 
     # tight layout
     fig.tight_layout()
@@ -1019,8 +1060,15 @@ def save_figure(fig, ax, filename):
     # save plot
     fig.savefig(f"{Inputs.export_folder}/{filename}", dpi = Inputs.dpi)
 
+    if Inputs.show_plots_flag == False:
+
+        plt.close()
+
 # main function
 def main():
+
+    print(torch.get_num_threads())         # Should print 4
+    print(torch.get_num_interop_threads()) # Should print 4
 
     # set pyTorch and numpy seeds
     torch.manual_seed(Inputs.rng_seed)
@@ -1059,7 +1107,8 @@ def main():
     )
     training_set = augment_data(training_set)
     training_loader = Data.DataLoader(
-        training_set, Inputs.batch_size, shuffle = True, generator = g, num_workers = 0
+        training_set, Inputs.batch_size, shuffle = True, generator = g,
+        num_workers = 0, persistent_workers = False
     )
 
     # create test data loader with batch size equal to entire test dataset
@@ -1076,18 +1125,26 @@ def main():
 
     # get list of networks to train
     nets = []
-    dropouts = [0, 0.02, 0.05]
-    sizes = [4, 8, 16]
-    for p in dropouts:
+    dropouts = [0]
+    channel_widths = [2, 4, 8, 16, 32]
+    layers = [4, 6, 8]
+    
+    # loop for each number of layers
+    for layer in layers:
 
-        for size in sizes:
+        # loop for each channel width
+        for channel_width in channel_widths:
+                        
+            # loop for each dropout
+            for p in dropouts:
 
-            nets.append(
-                RNO(
-                    Inputs.no_of_layers, Inputs.input_size, size, Inputs.output_size,
-                    Inputs.no_of_hidden_layers, size, p, dt
+                # create RNO and store in list
+                nets.append(
+                    RNO(
+                        layer, Inputs.input_size, Inputs.hidden_size, Inputs.output_size,
+                        Inputs.no_of_hidden_layers, channel_width, p, dt
+                    )
                 )
-            )
 
     # create neural network instance
     """nets = [RNO(
@@ -1132,15 +1189,19 @@ def main():
 
         # plot predictions
         net.plot_predictions(test_set, loss_function, input_normaliser, output_normaliser)
-        net.plot_loss_against_time(test_set, 0.5 * ymin, 1.2 * ymax)
+        net.plot_loss_against_time(test_set)
 
     plot_nets(nets)
 
 # upon script execution
 if __name__ == "__main__":
 
+    #torch.set_num_threads(2)          # Intra-op parallelism (within a single op, e.g. matmul)
+    #torch.set_num_interop_threads(2)  # Inter-op parallelism (parallel independent ops)
+
     # run main()
     main()
 
     # show all plots
-    plt.show()
+    if Inputs.show_plots_flag:
+        plt.show()
